@@ -39,6 +39,13 @@
 #include <kj/windows-sanity.h>
 #else
 #include <sys/socket.h>
+
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+
+#include <kj/io.h>
+#include <kj/thread.h>
 #endif
 
 #include <kj/async-io.h>
@@ -921,6 +928,132 @@ KJ_TEST("TLS client certificate verification") {
     KJ_EXPECT(!id->hasCertificate());
   }
 }
+
+#if !_WIN32
+
+class RawTlsClient {
+  // A client built directly on OpenSSL, presenting the `altKeypair` certificate. TlsContext's own
+  // client never resumes sessions, so it cannot show what a server does with them.
+
+public:
+  explicit RawTlsClient(int maxVersion): ctx(SSL_CTX_new(TLS_method())) {
+    KJ_ASSERT(ctx != nullptr);
+    KJ_ASSERT(SSL_CTX_set_max_proto_version(ctx, maxVersion));
+
+    BIO* bio = BIO_new_mem_buf(HOST_KEY2, -1);
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    KJ_ASSERT(key != nullptr);
+    KJ_ASSERT(SSL_CTX_use_PrivateKey(ctx, key));
+    EVP_PKEY_free(key);
+
+    X509* cert = readCert(VALID_CERT2);
+    KJ_ASSERT(SSL_CTX_use_certificate(ctx, cert));
+    X509_free(cert);
+    KJ_ASSERT(SSL_CTX_add_extra_chain_cert(ctx, readCert(INTERMEDIATE_CERT)));
+
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(ctx, &onNewSession);
+  }
+
+  ~RawTlsClient() noexcept(false) {
+    if (session != nullptr) SSL_SESSION_free(session);
+    SSL_CTX_free(ctx);
+  }
+
+  bool connect(int fd) {
+    // Runs a blocking handshake on `fd`, offering the last session the server issued, if any, and
+    // reads one message. Returns whether the session was resumed.
+
+    SSL* ssl = SSL_new(ctx);
+    KJ_ASSERT(ssl != nullptr);
+    KJ_DEFER(SSL_free(ssl));
+    SSL_set_app_data(ssl, this);
+    KJ_ASSERT(SSL_set_fd(ssl, fd));
+    KJ_ASSERT(SSL_set_tlsext_host_name(ssl, "example.com"));
+    if (session != nullptr) {
+      KJ_ASSERT(SSL_set_session(ssl, session));
+    }
+
+    KJ_ASSERT(SSL_connect(ssl) == 1, ERR_reason_error_string(ERR_get_error()));
+    // Reading also takes in the session tickets a TLS 1.3 server sends after the handshake.
+    char buf[4];
+    KJ_ASSERT(SSL_read(ssl, buf, sizeof(buf)) == sizeof(buf));
+    KJ_ASSERT(kj::StringPtr(buf) == "foo");
+    bool reused = SSL_session_reused(ssl);
+    SSL_shutdown(ssl);
+    return reused;
+  }
+
+  uint newSessionCount = 0;
+
+private:
+  SSL_CTX* ctx;
+  SSL_SESSION* session = nullptr;
+
+  static X509* readCert(const char* pem) {
+    BIO* bio = BIO_new_mem_buf(pem, -1);
+    X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    KJ_ASSERT(cert != nullptr);
+    return cert;
+  }
+
+  static int onNewSession(SSL* ssl, SSL_SESSION* newSession) {
+    auto& self = *reinterpret_cast<RawTlsClient*>(SSL_get_app_data(ssl));
+    ++self.newSessionCount;
+    if (self.session != nullptr) SSL_SESSION_free(self.session);
+    self.session = newSession;
+    return 1;  // we keep the reference
+  }
+};
+
+KJ_TEST("TLS server issues sessions only if it can resume them") {
+  auto test = [](bool verifyClients, int maxVersion) {
+    static TlsCertificate caCert(CA_CERT);
+    auto serverOptions = TlsTest::defaultServer();
+    serverOptions.verifyClients = verifyClients;
+    serverOptions.trustedCertificates = kj::arrayPtr(&caCert, 1);
+    TlsTest test(TlsTest::defaultClient(), kj::mv(serverOptions));
+    RawTlsClient client(maxVersion);
+
+    auto connect = [&]() {
+      int fds[2];
+      KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+      kj::AutoCloseFd clientFd(fds[0]);
+      auto raw = test.io.lowLevelProvider->wrapSocketFd(
+          fds[1], LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+
+      bool reused = false;
+      {
+        kj::Thread thread([&]() { reused = client.connect(clientFd); });
+        auto server = test.tlsServer.wrapServer(kj::mv(raw)).wait(test.io.waitScope);
+        server->write("foo", 4).wait(test.io.waitScope);
+      }  // joins the client
+      return reused;
+    };
+
+    // The second connection offers the session the first one got, if any.
+    KJ_EXPECT(!connect());
+    bool resumed = connect();
+    if (verifyClients) {
+      // We set no session ID context, without which OpenSSL fails the handshake of a client
+      // that offers a session to a server verifying clients: the server must not issue any.
+      KJ_EXPECT(client.newSessionCount == 0, client.newSessionCount, maxVersion);
+      KJ_EXPECT(!resumed, maxVersion);
+    } else {
+      KJ_EXPECT(client.newSessionCount > 0, maxVersion);
+      KJ_EXPECT(resumed, maxVersion);
+    }
+  };
+
+  test(true, TLS1_3_VERSION);
+  test(true, TLS1_2_VERSION);
+  test(false, TLS1_3_VERSION);
+  test(false, TLS1_2_VERSION);
+}
+
+#endif  // !_WIN32
 
 class MockConnectionReceiver final: public ConnectionReceiver {
   // This connection receiver allows mocked async connection establishment without the network.

@@ -761,6 +761,18 @@ TlsContext::TlsContext(Options options) {
 
   if (options.verifyClients) {
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+
+    // kj's client never resumes sessions, so issue none: neither session IDs
+    // nor tickets. They are worse than useless here: resuming skips client
+    // verification, so without a session ID context binding the session to this
+    // verification policy OpenSSL fails the handshake of any client that does
+    // offer one. Not sending these also saves a few hundred bytes per handshake.
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
+#if !defined(OPENSSL_IS_BORINGSSL) && OPENSSL_VERSION_NUMBER >= 0x10101000L
+    // OpenSSL's TLS 1.3 server still sends (stateful) tickets with SSL_OP_NO_TICKET.
+    SSL_CTX_set_num_tickets(ctx, 0);
+#endif
   }
 
   // honor options.minVersion
